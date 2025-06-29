@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const stripe = require("stripe")(process.env.PAYMENT_GATEWAY_KEY);
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -52,6 +53,25 @@ async function run() {
       }
     });
 
+    // get a specific parcel by Id
+    app.get("/parcels/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        const query = { _id: new ObjectId(id) };
+        const parcel = await parcelsCollection.findOne(query);
+
+        if (!parcel) {
+          return res.status(404).send({ message: "Parcel not found" });
+        }
+
+        res.send(parcel);
+      } catch (error) {
+        console.error("Error fetching parcel by ID:", error);
+        res.status(500).send({ message: "Failed to get parcel" });
+      }
+    });
+
     // POST: Add a new parcel
     app.post("/parcels", async (req, res) => {
       try {
@@ -84,6 +104,74 @@ async function run() {
         res
           .status(500)
           .send({ success: false, message: "Failed to delete parcel" });
+      }
+    });
+
+    app.post("/payments", async (req, res) => {
+      try {
+        const { parcelId, email, amount, transactionId, paymentMethod } =
+          req.body;
+
+        if (
+          !parcelId ||
+          !email ||
+          !amount ||
+          !transactionId ||
+          !paymentMethod
+        ) {
+          return res
+            .status(400)
+            .send({ message: "Missing required payment info" });
+        }
+
+        const parcelObjectId = new ObjectId(parcelId);
+
+        // 1. Update the parcel document with payment info
+        const updateResult = await parcelsCollection.updateOne(
+          { _id: parcelObjectId },
+          {
+            $set: {
+              paymentStatus: "paid",
+              paidAt: new Date(),
+            },
+          }
+        );
+
+        // 2. Create a new payment history entry
+        const paymentEntry = {
+          parcelId: parcelObjectId,
+          email,
+          amount,
+          transactionId,
+          paymentMethod, // e.g. "card", "bkash", etc.
+          paidAt: new Date(),
+        };
+
+        const insertResult = await paymentsCollection.insertOne(paymentEntry);
+
+        res.send({
+          message: "Payment processed and recorded",
+          updateResult,
+          insertResult,
+        });
+      } catch (error) {
+        console.error("Payment processing error:", error);
+        res.status(500).send({ message: "Failed to process payment" });
+      }
+    });
+
+    app.post("/create-payment-intent", async (req, res) => {
+      const amountInCents = req.body.amountInCents;
+      try {
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: amountInCents, // Amount in cents
+          currency: "usd",
+          payment_method_types: ["card"],
+        });
+
+        res.json({ clientSecret: paymentIntent.client_secret });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
       }
     });
 
