@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -61,6 +61,29 @@ async function run() {
       } catch (error) {
         console.error("Error inserting parcel:", error);
         res.status(500).send({ message: "Failed to add parcel" });
+      }
+    });
+
+    // DELETE a parcel by ID
+    app.delete("/parcels/:id", async (req, res) => {
+      const { id } = req.params;
+      try {
+        const result = await parcelsCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        if (result.deletedCount === 1) {
+          res
+            .status(200)
+            .send({ success: true, message: "Parcel deleted successfully" });
+        } else {
+          res.status(404).send({ success: false, message: "Parcel not found" });
+        }
+      } catch (error) {
+        console.error("Error deleting parcel:", error);
+        res
+          .status(500)
+          .send({ success: false, message: "Failed to delete parcel" });
       }
     });
 
