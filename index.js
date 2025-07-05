@@ -3,6 +3,7 @@ const cors = require("cors");
 require("dotenv").config();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.PAYMENT_GATEWAY_KEY);
+const admin = require("firebase-admin");
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -10,6 +11,14 @@ const port = process.env.PORT || 5000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+
+const serviceAccount = require("./firebase-admin-key.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.actwx8z.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
@@ -29,14 +38,55 @@ async function run() {
 
     const db = client.db("parcelDB");
     const parcelsCollection = db.collection("parcels");
+    const paymentsCollection = db.collection("payments");
+    const trackingCollection = db.collection("tracking");
+    const usersCollection = db.collection('users');
+
+    // custom middlewares
+    const verifyFBToken = async(req, res, next) => {
+      const authHeader = req.headers.authorization;
+      if(!authHeader){
+        return res.status(401).send({message: 'unauthorized access'});
+      }
+
+      const token = authHeader.split(' ')[1];
+      if(!token){
+        return res.status(401).send({message: 'unauthorized access'});
+      }
+
+      //verify the token
+    try{
+      const decoded = await admin.auth().verifyIdToken(token);
+      req.decoded = decoded;
+      next();
+    }
+    catch(error){
+      return res.status(403).send({message: 'forbidden access'});
+    }
+    }
+
+    app.post('/users', async(req, res) => {
+      const email = req.body.email;
+      const userExists = await usersCollection.findOne({email})
+      if(userExists){
+        return res.status(200).send({message: 'User already exists', inserted: false});
+      }
+
+      const user = req.body;
+      const result = await usersCollection.insertOne(user);
+      res.send(result);
+    })
 
     app.get("/parcels", async (req, res) => {
-      const parcels = await parcelsCollection.find().toArray();
+      const email = req.query.email;
+
+      const query = { email: email };
+      const parcels = await parcelsCollection.find(query).toArray();
       res.send(parcels);
     });
 
     // get parcels api
-    app.get("/parcels", async (req, res) => {
+    app.get("/parcels", verifyFBToken, async (req, res) => {
       try {
         const userEmail = req.query.email;
         const query = userEmail ? { email: userEmail } : {};
@@ -107,22 +157,77 @@ async function run() {
       }
     });
 
+    // post tracking parcel
+    app.post("/tracking", async (req, res) => {
+      try {
+        const { trackingId, parcelId, status, location } = req.body;
+
+        if (!trackingId || !parcelId || !status || !location) {
+          return res.status(400).send({ message: "Missing tracking data" });
+        }
+
+        const entry = {
+          tracking_id: trackingId,
+          parcelId: new ObjectId(parcelId),
+          status,
+          location,
+          timestamp: new Date(),
+        };
+
+        const result = await trackingCollection.insertOne(entry);
+        res.send({ message: "Tracking update saved", result });
+      } catch (error) {
+        console.error("Tracking insert error:", error);
+        res.status(500).send({ message: "Failed to add tracking update" });
+      }
+    });
+
+    // Get all tracking updates for a tracking ID (latest first)
+    app.get("/tracking/:trackingId", async (req, res) => {
+      const trackingId = req.params.trackingId;
+
+      const updates = await trackingCollection
+        .findOne({ tracking_id: trackingId }) 
+        .sort({ timestamp: -1 })
+        .toArray();
+
+      if (!updates.length) {
+        return res.status(404).send({ message: "No tracking updates found" });
+      }
+
+      res.send(updates);
+    });
+
+    app.get("/payments", verifyFBToken, async (req, res) => {
+
+      console.log('headers in payments', req.headers)
+      try {
+        const userEmail = req.query.email;
+
+        console.log("decoded", req.decoded)
+        if(req.decoded.email !== userEmail){
+          return res.status(403).send({message: 'forbidden access'})
+        }
+
+        const query = userEmail ? { email: userEmail } : {};
+        const sort = { paid_at: -1 }; // Latest first
+
+        const payments = await paymentsCollection
+          .find(query)
+          .sort(sort)
+          .toArray();
+        res.send(payments);
+      } catch (error) {
+        console.error("Error fetching payment history:", error);
+        res.status(500).send({ message: "Failed to load payment history" });
+      }
+    });
+
+    // record payment and update parcel status
     app.post("/payments", async (req, res) => {
       try {
         const { parcelId, email, amount, transactionId, paymentMethod } =
           req.body;
-
-        if (
-          !parcelId ||
-          !email ||
-          !amount ||
-          !transactionId ||
-          !paymentMethod
-        ) {
-          return res
-            .status(400)
-            .send({ message: "Missing required payment info" });
-        }
 
         const parcelObjectId = new ObjectId(parcelId);
 
@@ -131,8 +236,8 @@ async function run() {
           { _id: parcelObjectId },
           {
             $set: {
-              paymentStatus: "paid",
-              paidAt: new Date(),
+              payment_status: "paid",
+              paid_at: new Date(),
             },
           }
         );
@@ -144,7 +249,8 @@ async function run() {
           amount,
           transactionId,
           paymentMethod, // e.g. "card", "bkash", etc.
-          paidAt: new Date(),
+          paid_at_string: new Date().toISOString(),
+          paid_at: new Date(),
         };
 
         const insertResult = await paymentsCollection.insertOne(paymentEntry);
@@ -160,6 +266,7 @@ async function run() {
       }
     });
 
+    // payment intent
     app.post("/create-payment-intent", async (req, res) => {
       const amountInCents = req.body.amountInCents;
       try {
