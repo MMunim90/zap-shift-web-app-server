@@ -12,13 +12,11 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-
 const serviceAccount = require("./firebase-admin-key.json");
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(serviceAccount),
 });
-
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.actwx8z.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
@@ -40,42 +38,155 @@ async function run() {
     const parcelsCollection = db.collection("parcels");
     const paymentsCollection = db.collection("payments");
     const trackingCollection = db.collection("tracking");
-    const usersCollection = db.collection('users');
+    const usersCollection = db.collection("users");
+    const riderApplicationsCollection = db.collection("riderApplications");
 
     // custom middlewares
-    const verifyFBToken = async(req, res, next) => {
+    const verifyFBToken = async (req, res, next) => {
       const authHeader = req.headers.authorization;
-      if(!authHeader){
-        return res.status(401).send({message: 'unauthorized access'});
+      if (!authHeader) {
+        return res.status(401).send({ message: "unauthorized access" });
       }
 
-      const token = authHeader.split(' ')[1];
-      if(!token){
-        return res.status(401).send({message: 'unauthorized access'});
+      const token = authHeader.split(" ")[1];
+      if (!token) {
+        return res.status(401).send({ message: "unauthorized access" });
       }
 
       //verify the token
-    try{
-      const decoded = await admin.auth().verifyIdToken(token);
-      req.decoded = decoded;
-      next();
-    }
-    catch(error){
-      return res.status(403).send({message: 'forbidden access'});
-    }
-    }
+      try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.decoded = decoded;
+        next();
+      } catch (error) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+    };
 
-    app.post('/users', async(req, res) => {
+    // post be a rider application
+    app.post("/riderApplications", verifyFBToken, async (req, res) => {
+      try {
+        const {
+          name,
+          email,
+          age,
+          region,
+          district,
+          phone,
+          nid,
+          nidImage,
+          bikeImage,
+          bikeBrand,
+          bikeRegNumber,
+          additionalInfo,
+        } = req.body;
+
+        const newApplication = {
+          name,
+          email,
+          age: Number(age),
+          region,
+          district,
+          phone,
+          nid,
+          nidImage,
+          bikeImage,
+          bikeBrand,
+          bikeRegNumber,
+          additionalInfo: additionalInfo || "",
+          status: "pending",
+          createdAt: new Date(),
+        };
+
+        const result = await riderApplicationsCollection.insertOne(
+          newApplication
+        );
+        res.status(201).json({ insertedId: result.insertedId });
+      } catch (error) {
+        console.error("Error submitting rider application:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+
+    app.get("/riderApplications/pending", verifyFBToken, async (req, res) => {
+      try {
+        const pendingRiders = await riderApplicationsCollection
+          .find({ status: "pending" })
+          .sort({ createdAt: -1 }) // newest first
+          .toArray();
+
+        res.send(pendingRiders);
+      } catch (error) {
+        console.error("Failed to fetch pending riders:", error);
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    // approved rider
+    app.patch(
+      "/riderApplications/status/:id",
+      verifyFBToken,
+      async (req, res) => {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        if (!["approved", "rejected"].includes(status)) {
+          return res.status(400).json({ message: "Invalid status value" });
+        }
+
+        try {
+          const result = await riderApplicationsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { status } }
+          );
+
+          if (result.modifiedCount === 0) {
+            return res
+              .status(404)
+              .json({ message: "Application not found or already updated" });
+          }
+
+          res.json({ message: "Status updated successfully" });
+        } catch (error) {
+          console.error("Failed to update rider status:", error);
+          res.status(500).json({ message: "Server error" });
+        }
+      }
+    );
+
+    // reject rider
+    app.delete("/riderApplications/:id", verifyFBToken, async (req, res) => {
+      const { id } = req.params;
+
+      try {
+        const result = await riderApplicationsCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ message: "Application not found" });
+        }
+
+        res.json({ message: "Application deleted successfully" });
+      } catch (error) {
+        console.error("Failed to delete rider application:", error);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
+
+    app.post("/users", async (req, res) => {
       const email = req.body.email;
-      const userExists = await usersCollection.findOne({email})
-      if(userExists){
-        return res.status(200).send({message: 'User already exists', inserted: false});
+      const userExists = await usersCollection.findOne({ email });
+      if (userExists) {
+        return res
+          .status(200)
+          .send({ message: "User already exists", inserted: false });
       }
 
       const user = req.body;
       const result = await usersCollection.insertOne(user);
       res.send(result);
-    })
+    });
 
     app.get("/parcels", async (req, res) => {
       const email = req.query.email;
@@ -187,7 +298,7 @@ async function run() {
       const trackingId = req.params.trackingId;
 
       const updates = await trackingCollection
-        .findOne({ tracking_id: trackingId }) 
+        .findOne({ tracking_id: trackingId })
         .sort({ timestamp: -1 })
         .toArray();
 
@@ -199,14 +310,13 @@ async function run() {
     });
 
     app.get("/payments", verifyFBToken, async (req, res) => {
-
-      console.log('headers in payments', req.headers)
+      console.log("headers in payments", req.headers);
       try {
         const userEmail = req.query.email;
 
-        console.log("decoded", req.decoded)
-        if(req.decoded.email !== userEmail){
-          return res.status(403).send({message: 'forbidden access'})
+        console.log("decoded", req.decoded);
+        if (req.decoded.email !== userEmail) {
+          return res.status(403).send({ message: "forbidden access" });
         }
 
         const query = userEmail ? { email: userEmail } : {};
