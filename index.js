@@ -42,6 +42,8 @@ async function run() {
     const riderApplicationsCollection = db.collection("riderApplications");
 
     // custom middlewares
+
+    // verify firebase token
     const verifyFBToken = async (req, res, next) => {
       const authHeader = req.headers.authorization;
       if (!authHeader) {
@@ -52,7 +54,6 @@ async function run() {
       if (!token) {
         return res.status(401).send({ message: "unauthorized access" });
       }
-
       //verify the token
       try {
         const decoded = await admin.auth().verifyIdToken(token);
@@ -61,6 +62,18 @@ async function run() {
       } catch (error) {
         return res.status(403).send({ message: "forbidden access" });
       }
+    };
+
+    // verify admin
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.decoded.email;
+      const query = { email };
+      const user = await usersCollection.findOne(query);
+
+      if (!user || user.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
     };
 
     // post be a rider application
@@ -108,19 +121,44 @@ async function run() {
       }
     });
 
-    app.get("/riderApplications/pending", verifyFBToken, async (req, res) => {
-      try {
-        const pendingRiders = await riderApplicationsCollection
-          .find({ status: "pending" })
-          .sort({ createdAt: -1 }) // newest first
-          .toArray();
+    app.get(
+      "/riderApplications/pending",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const pendingRiders = await riderApplicationsCollection
+            .find({ status: "pending" })
+            .sort({ createdAt: -1 }) // newest first
+            .toArray();
 
-        res.send(pendingRiders);
-      } catch (error) {
-        console.error("Failed to fetch pending riders:", error);
-        res.status(500).send({ message: "Server error" });
+          res.send(pendingRiders);
+        } catch (error) {
+          console.error("Failed to fetch pending riders:", error);
+          res.status(500).send({ message: "Server error" });
+        }
       }
-    });
+    );
+
+    // getting approved rider
+    app.get(
+      "/riderApplications/approved",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const approvedRiders = await riderApplicationsCollection
+            .find({ status: "approved" })
+            .sort({ createdAt: -1 }) // optional: latest first
+            .toArray();
+
+          res.send(approvedRiders);
+        } catch (error) {
+          console.error("Error fetching approved riders:", error);
+          res.status(500).send({ message: "Failed to fetch approved riders" });
+        }
+      }
+    );
 
     // approved rider
     app.patch(
@@ -128,9 +166,9 @@ async function run() {
       verifyFBToken,
       async (req, res) => {
         const { id } = req.params;
-        const { status } = req.body;
+        const { status, email } = req.body;
 
-        if (!["approved", "rejected"].includes(status)) {
+        if (!["approved", "rejected", "inactive"].includes(status)) {
           return res.status(400).json({ message: "Invalid status value" });
         }
 
@@ -139,6 +177,21 @@ async function run() {
             { _id: new ObjectId(id) },
             { $set: { status } }
           );
+
+          // update user role for accepting rider
+          if (status === "approved") {
+            const useQuery = { email };
+            const userUpdateDoc = {
+              $set: {
+                role: "rider",
+              },
+            };
+            const roleResult = await usersCollection.updateOne(
+              useQuery,
+              userUpdateDoc
+            );
+            console.log(roleResult.modifiedCount);
+          }
 
           if (result.modifiedCount === 0) {
             return res
@@ -155,22 +208,118 @@ async function run() {
     );
 
     // reject rider
-    app.delete("/riderApplications/:id", verifyFBToken, async (req, res) => {
-      const { id } = req.params;
+    app.delete(
+      "/riderApplications/:id",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+
+        try {
+          const result = await riderApplicationsCollection.deleteOne({
+            _id: new ObjectId(id),
+          });
+
+          if (result.deletedCount === 0) {
+            return res.status(404).json({ message: "Application not found" });
+          }
+
+          res.json({ message: "Application deleted successfully" });
+        } catch (error) {
+          console.error("Failed to delete rider application:", error);
+          res.status(500).json({ message: "Server error" });
+        }
+      }
+    );
+
+    // GET /users/search?email=user@example.com
+    app.get("/users/search", verifyFBToken, verifyAdmin, async (req, res) => {
+      const email = req.query.email;
+      if (!email) return res.status(400).send({ message: "Email required" });
+
+      const regex = new RegExp(email, "i"); // case-insensitive partial match
 
       try {
-        const result = await riderApplicationsCollection.deleteOne({
-          _id: new ObjectId(id),
-        });
+        const users = await usersCollection
+          .find({ email: { $regex: regex } })
+          .project({ email: 1, createdAt: 1, role: 1 })
+          .limit(10)
+          .toArray();
 
-        if (result.deletedCount === 0) {
-          return res.status(404).json({ message: "Application not found" });
+        res.send(users);
+      } catch (error) {
+        console.error("Error searching users:", error);
+        res.status(500).send({ message: "Error searching users" });
+      }
+    });
+
+    // make admin
+    app.patch(
+      "/users/admin/:id",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { role } = req.body;
+
+        if (!["admin", "user"].includes(role)) {
+          return res.status(400).send({ message: "Invalid role" });
         }
 
-        res.json({ message: "Application deleted successfully" });
+        const requesterEmail = req.decoded?.email;
+
+        // Optional: Check if requester is admin before allowing the update
+        const requester = await usersCollection.findOne({
+          email: requesterEmail,
+        });
+
+        if (requester?.role !== "admin") {
+          return res
+            .status(403)
+            .send({ message: "Only admins can update roles" });
+        }
+
+        try {
+          const result = await usersCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { role } }
+          );
+
+          if (result.modifiedCount === 0) {
+            return res
+              .status(404)
+              .send({ message: "User not found or role unchanged" });
+          }
+
+          res.send({ message: "Role updated successfully", result });
+        } catch (error) {
+          console.error("Error updating user role:", error);
+          res.status(500).send({ message: "Error updating user role" });
+        }
+      }
+    );
+
+    // find user role
+    app.get("/users/role/:email", verifyFBToken, async (req, res) => {
+      const email = req.params.email;
+
+      if (!email) {
+        return res.status(400).send({ message: "Email is required" });
+      }
+
+      try {
+        const user = await usersCollection.findOne(
+          { email },
+          { projection: { role: 1 } } // Only fetch the role field
+        );
+
+        if (!user) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        res.send({ role: user.role || "user" }); // Default to "user" if no role
       } catch (error) {
-        console.error("Failed to delete rider application:", error);
-        res.status(500).json({ message: "Server error" });
+        console.error("Error fetching user role:", error);
+        res.status(500).send({ message: "Server error" });
       }
     });
 
@@ -188,25 +337,48 @@ async function run() {
       res.send(result);
     });
 
-    app.get("/parcels", async (req, res) => {
-      const email = req.query.email;
+    // GET /riders?district=SomeDistrict
+    app.get("/riders", async (req, res) => {
+      try {
+        const { senderArea } = req.query;
 
-      const query = { email: email };
-      const parcels = await parcelsCollection.find(query).toArray();
-      res.send(parcels);
+        if (!senderArea) {
+          return res.status(400).send({ message: "senderArea is required" });
+        }
+
+        // Assuming 'district' field in riderApplications matches the parcel's senderArea
+        const riders = await riderApplicationsCollection
+          .find({
+            district: senderArea,
+            status: "approved",
+          })
+          .project({ name: 1, email: 1, district: 1, phone: 1, bikeBrand: 1 }) // optional projection
+          .toArray();
+
+        res.send(riders);
+      } catch (error) {
+        console.error("Error fetching riders:", error);
+        res.status(500).send({ message: "Failed to fetch riders" });
+      }
     });
 
     // get parcels api
     app.get("/parcels", verifyFBToken, async (req, res) => {
       try {
-        const userEmail = req.query.email;
-        const query = userEmail ? { email: userEmail } : {};
-        const sort = { _id: -1 }; // latest first
+        const { email, payment_status, delivery_status } = req.query;
 
+        const query = {};
+
+        if (email) query.email = email;
+        if (payment_status) query.payment_status = payment_status;
+        if (delivery_status) query.delivery_status = delivery_status;
+
+        // console.log('parcel query', req.query, query)
         const parcels = await parcelsCollection
           .find(query)
-          .sort(sort)
+          .sort({ _id: -1 }) // latest first
           .toArray();
+
         res.send(parcels);
       } catch (error) {
         console.error("Error fetching parcels:", error);
@@ -297,16 +469,21 @@ async function run() {
     app.get("/tracking/:trackingId", async (req, res) => {
       const trackingId = req.params.trackingId;
 
-      const updates = await trackingCollection
-        .findOne({ tracking_id: trackingId })
-        .sort({ timestamp: -1 })
-        .toArray();
+      try {
+        const updates = await parcelsCollection
+          .find({ tracking_id: trackingId })
+          .sort({ timestamp: -1 })
+          .toArray();
 
-      if (!updates.length) {
-        return res.status(404).send({ message: "No tracking updates found" });
+        if (!updates.length) {
+          return res.status(404).send({ message: "No tracking updates found" });
+        }
+
+        res.send(updates);
+      } catch (error) {
+        console.error("Error fetching tracking updates:", error);
+        res.status(500).send({ message: "Internal Server Error" });
       }
-
-      res.send(updates);
     });
 
     app.get("/payments", verifyFBToken, async (req, res) => {
