@@ -52,7 +52,6 @@ async function run() {
       }
 
       const token = authHeader.split(" ")[1];
-      console.log(token)
       if (!token) {
         return res.status(401).send({ message: "unauthorized access" });
       }
@@ -91,7 +90,7 @@ async function run() {
     };
 
     // dashboard get route for rider
-    app.get("/parcels/delivery/status-count", async (req, res) => {
+    app.get("/parcels/delivery/status-count", verifyFBToken, verifyAdmin, async (req, res) => {
       const pipeline = [
         {
           $group: {
@@ -307,7 +306,7 @@ async function run() {
               useQuery,
               userUpdateDoc
             );
-            console.log(roleResult.modifiedCount);
+            //console.log(roleResult.modifiedCount);
           }
 
           if (result.modifiedCount === 0) {
@@ -852,11 +851,11 @@ async function run() {
     });
 
     app.get("/payments", verifyFBToken, async (req, res) => {
-      console.log("headers in payments", req.headers);
+      //console.log("headers in payments", req.headers);
       try {
         const userEmail = req.query.email;
 
-        console.log("decoded", req.decoded);
+        //console.log("decoded", req.decoded);
         if (req.decoded.email !== userEmail) {
           return res.status(403).send({ message: "forbidden access" });
         }
